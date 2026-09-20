@@ -1,4 +1,5 @@
 name: Build dossier PDF
+
 on:
   push:
     branches: [main]
@@ -6,23 +7,126 @@ on:
       - "dossier/**"
       - ".github/workflows/build-dossier.yml"
   workflow_dispatch:
+
 permissions:
-  contents: read
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install render tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils imagemagick python3-matplotlib python3-pip
+          pip3 install --break-system-packages ezdxf
+
+      - name: Render PDF attachments
+        working-directory: dossier
+        run: |
+          mkdir -p figures
+          for f in attachments/*.pdf; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f" .pdf)"
+            mkdir -p "figures/$base"
+            pdftoppm -jpeg -r 150 "$f" "figures/$base/page" >/dev/null 2>&1
+          done
+
+      - name: Render cadastral DXF
+        working-directory: dossier
+        run: |
+          python3 - <<'PY'
+          import ezdxf, matplotlib.pyplot as plt
+          from pathlib import Path
+          src=Path("attachments/F158_012400.dxf")
+          out=Path("figures/particella-509-dxf.jpg")
+          doc=ezdxf.readfile(src)
+          msp=doc.modelspace()
+          parcel=None
+          building=None
+          def bbox(poly):
+              pts=[(v.dxf.location.x,v.dxf.location.y) for v in poly.vertices]
+              xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
+              return min(xs),min(ys),max(xs),max(ys),pts
+          candidates=[]
+          for e in msp:
+              if e.dxftype()=="POLYLINE" and e.dxf.layer in {"PARTICELLE","FABBRICATI"}:
+                  try:
+                      b=bbox(e)
+                      candidates.append((e,b))
+                  except Exception:
+                      pass
+          # Known centroid vicinity from prior inspection of the source DXF.
+          cx,cy=49044.84,46098.306
+          for e,b in candidates:
+              xmin,ymin,xmax,ymax,pts=b
+              if xmin<=cx<=xmax and ymin<=cy<=ymax:
+                  if e.dxf.layer=="PARTICELLE": parcel=(e,b)
+                  if e.dxf.layer=="FABBRICATI": building=(e,b)
+          fig,ax=plt.subplots(figsize=(8,8))
+          # context
+          for e,b in candidates:
+              xmin,ymin,xmax,ymax,pts=b
+              if xmax < cx-90 or xmin > cx+90 or ymax < cy-90 or ymin > cy+90: 
+                  continue
+              xs=[p[0] for p in pts]+[pts[0][0]]
+              ys=[p[1] for p in pts]+[pts[0][1]]
+              ax.plot(xs,ys,linewidth=.5)
+          if parcel:
+              pts=parcel[1][4]; xs=[p[0] for p in pts]+[pts[0][0]]; ys=[p[1] for p in pts]+[pts[0][1]]
+              ax.plot(xs,ys,linewidth=2.4)
+          if building:
+              pts=building[1][4]; xs=[p[0] for p in pts]+[pts[0][0]]; ys=[p[1] for p in pts]+[pts[0][1]]
+              ax.plot(xs,ys,linewidth=2.0)
+          ax.annotate("Particella 509",xy=(cx,cy),xytext=(cx+35,cy+35),
+                      arrowprops=dict(arrowstyle="->",lw=1.5),fontsize=12)
+          ax.set_aspect("equal",adjustable="box")
+          ax.set_title("Foglio 124 - particella 509")
+          ax.set_xlabel("Coordinate catastali")
+          ax.set_ylabel("Coordinate catastali")
+          fig.tight_layout()
+          fig.savefig(out,dpi=180)
+          PY
+
+      - name: Build attachment contact sheets
+        working-directory: dossier
+        run: |
+          mkdir -p figures/contact-sheets
+          for d in figures/DOC_* figures/Ric_* figures/visura_*; do
+            [ -d "$d" ] || continue
+            base="$(basename "$d")"
+            files=("$d"/*.jpg)
+            [ -e "${files[0]}" ] || continue
+            montage "$d"/*.jpg -thumbnail 700x990 -tile 2x -geometry +12+12 "figures/contact-sheets/$base.jpg"
+          done
+
       - name: Compile LaTeX
         uses: xu-cheng/latex-action@v3
         with:
           root_file: main.tex
           working_directory: dossier
           args: -pdf -file-line-error -halt-on-error -interaction=nonstopmode
-      - name: Upload PDF
+
+      - name: Upload dossier artifact
         uses: actions/upload-artifact@v4
         with:
           name: dossier-via-bufalini
-          path: dossier/main.pdf
+          path: |
+            dossier/main.pdf
+            dossier/figures/**
           if-no-files-found: error
+
+      - name: Publish rendered figures to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dossier/figures
+          if git diff --cached --quiet; then
+            echo "No rendered figure changes"
+          else
+            git commit -m "Render attachment figures"
+            git push
+          fi
